@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 // ==========================================
-// INTERFACES Y TIPOS
+// INTERFACES & TYPES
 // ==========================================
 interface QueryParams {
   orig_state?: string;
@@ -17,13 +17,19 @@ interface QueryParams {
 
 interface LoadRecord {
   load_id: string;
-  origin: string;
-  destination: string;
-  pickup_date: string;
-  equipment_type: string;
-  posted_rate: number;
-  miles: number;
-  status: string;
+  origin?: string;
+  destination?: string;
+  pickup_date?: string;
+  equipment_type?: string;
+  posted_rate?: number;
+  miles?: number;
+  status?: string;
+}
+
+interface BookRecord {
+  load_id: string;
+  mc_number: string;
+  agreed_rate: string | number;
 }
 
 interface NegotiateBody {
@@ -32,8 +38,10 @@ interface NegotiateBody {
   load_id?: string;
 }
 
+type StrategyParams = QueryParams | LoadRecord | BookRecord | any;
+
 // ==========================================
-// CLIENTE SOCKET TCP
+// TCP SOCKET CLIENT
 // ==========================================
 class TcpSocketClient {
   private timeoutMs: number;
@@ -91,35 +99,91 @@ class TcpSocketClient {
 }
 
 // ==========================================
-// ESTRATEGIA Y COMANDOS
+// COMMAND STRATEGIES
 // ==========================================
-class CommandFactory {
-  public createCommand(
-    action: string,
-    params: QueryParams,
-    authToken: string,
-  ): string {
-    const act = action ? action.toUpperCase() : "";
-    if (act === "QUERY" || act === "LOAD_QUERY") {
-      const { orig_state, dest_state, orig_city, eqtype, max_results } = params;
-      const parts = ["CMD:LOAD_QUERY", `AUTH:${authToken}`];
+abstract class CommandStrategy {
+  abstract build(params: StrategyParams, authToken: string): string;
+}
 
-      if (orig_city) parts.push(`ORIG_CITY:${orig_city.trim()}`);
-      if (orig_state)
-        parts.push(`ORIG_STATE:${orig_state.trim().toUpperCase()}`);
-      if (dest_state)
-        parts.push(`DEST_STATE:${dest_state.trim().toUpperCase()}`);
-      if (eqtype) parts.push(`EQTYPE:${eqtype.trim().toUpperCase()}`);
-      if (max_results) parts.push(`MAX_RESULTS:${max_results}`);
+class QueryCommandStrategy extends CommandStrategy {
+  build(params: QueryParams, authToken: string): string {
+    const { orig_state, dest_state, orig_city, eqtype, max_results } = params;
+    const parts = [`CMD:LOAD_QUERY`, `AUTH:${authToken}`];
 
-      return parts.join("|");
-    }
-    throw new Error(`Unsupported action: ${action}`);
+    if (orig_city) parts.push(`ORIG_CITY:${orig_city.trim()}`);
+    if (orig_state) parts.push(`ORIG_STATE:${orig_state.trim().toUpperCase()}`);
+    if (dest_state) parts.push(`DEST_STATE:${dest_state.trim().toUpperCase()}`);
+    if (eqtype) parts.push(`EQTYPE:${eqtype.trim().toUpperCase()}`);
+    if (max_results) parts.push(`MAX_RESULTS:${max_results}`);
+
+    return parts.join("|");
+  }
+}
+
+class GetCommandStrategy extends CommandStrategy {
+  build(params: LoadRecord, authToken: string): string {
+    const { load_id } = params;
+    return `CMD:LOAD_GET|AUTH:${authToken}|LOAD_ID:${load_id}`;
+  }
+}
+
+class BookCommandStrategy extends CommandStrategy {
+  build(params: BookRecord, authToken: string): string {
+    const { load_id, mc_number, agreed_rate } = params;
+    const rateStr = String(Math.round(Number(agreed_rate) * 100)).padStart(
+      7,
+      "0",
+    );
+    return `CMD:LOAD_BOOK|AUTH:${authToken}|LOAD_ID:${load_id}|MC_NUM:${mc_number}|AGREED_RATE:${rateStr}`;
   }
 }
 
 // ==========================================
-// PARSER DE RESPUESTAS LTMS
+// FACTORY & REGISTRY
+// ==========================================
+class CommandFactory {
+  private registry: Map<string, CommandStrategy>;
+
+  constructor() {
+    this.registry = new Map<string, CommandStrategy>();
+    this.registerDefaults();
+  }
+
+  public register(action: string, strategy: CommandStrategy): void {
+    this.registry.set(action.toUpperCase(), strategy);
+  }
+
+  private registerDefaults(): void {
+    const queryStrategy = new QueryCommandStrategy();
+    const getStrategy = new GetCommandStrategy();
+    const bookStrategy = new BookCommandStrategy();
+
+    this.register("QUERY", queryStrategy);
+    this.register("LOAD_QUERY", queryStrategy);
+
+    this.register("GET", getStrategy);
+    this.register("LOAD_GET", getStrategy);
+    this.register("GET_LOAD", getStrategy);
+
+    this.register("BOOK", bookStrategy);
+    this.register("LOAD_BOOK", bookStrategy);
+  }
+
+  public createCommand(
+    action: string,
+    params: StrategyParams,
+    authToken: string,
+  ): string {
+    const strategy = this.registry.get(action?.toUpperCase());
+    if (!strategy) {
+      throw new Error(`Unsupported Action: '${action}'`);
+    }
+    return strategy.build(params, authToken);
+  }
+}
+
+// ==========================================
+// RESPONSE PARSER
 // ==========================================
 function parseLtmsResponse(rawResponse: string): LoadRecord[] {
   const lines = rawResponse.replace(/\r\n/g, "\n").split("\n");
@@ -157,7 +221,7 @@ function parseLtmsResponse(rawResponse: string): LoadRecord[] {
 }
 
 // ==========================================
-// RUTA 1: LTMS QUERY (POST /)
+// ROUTES
 // ==========================================
 app.post("/", async (req: Request, res: Response) => {
   try {
@@ -187,9 +251,6 @@ app.post("/", async (req: Request, res: Response) => {
   }
 });
 
-// ==========================================
-// RUTA 2: NEGOTIATION (POST /negotiate)
-// ==========================================
 app.post("/negotiate", (req: Request<{}, {}, NegotiateBody>, res: Response) => {
   const { posted_rate, offered_rate, load_id } = req.body;
   const MAX_RATE = 2000;
@@ -213,7 +274,7 @@ app.post("/negotiate", (req: Request<{}, {}, NegotiateBody>, res: Response) => {
       counter_offer: counterOffer,
       agent_instruction: isPossible
         ? `Accept the offer of $${offered}. Proceed with the confirmation process.`
-        : `Indicate the carrier that it is not possible to get: $${offered}. The best you can offer is $${counterOffer}.`,
+        : `Indicate to the carrier that it is not possible to pay $${offered}. The best you can offer is $${counterOffer}.`,
     },
   });
 });
